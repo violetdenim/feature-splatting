@@ -27,11 +27,11 @@ pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindi
 pip install nerfstudio
 ```
 
-As of this version (0.0.2), we use the gsplat kernel, which comes with NS installation. If you just want to try out feature splatting,
+As of this version (0.0.3), we use the gsplat kernel, which comes with NS installation. If you just want to try out feature splatting,
 you can run,
 
 ```bash
-pip install git+https://github.com/vuer-ai/feature-splatting-ns
+pip install git+https://github.com/vuer-ai/feature-splatting
 ```
 
 or, for dev purpose, run,
