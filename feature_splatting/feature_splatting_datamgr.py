@@ -12,33 +12,13 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
 )
 from nerfstudio.utils.rich_utils import CONSOLE
 
-from feature_splatting.feature_extractor_cfg import SAMCLIPArgs
-
-# SAMCLIP
+from feature_splatting.feature_extractor_cfg import DINOArgs
 from feature_splatting.feature_extractor import batch_extract_feature
 
-feat_type_to_extract_fn = {
-    "CLIP": None,
-    "DINO": None,
-    "SAMCLIP": batch_extract_feature,
-}
-
-feat_type_to_args = {
-    "CLIP": None,
-    "DINO": None,
-    "SAMCLIP": SAMCLIPArgs,
-}
-
-feat_type_to_main_feature_name = {
-    "CLIP": "clip",
-    "DINO": "dino",
-    "SAMCLIP": "samclip",
-}
 
 @dataclass
 class FeatureSplattingDataManagerConfig(FullImageDatamanagerConfig):
     _target: Type = field(default_factory=lambda: FeatureSplattingDataManager)
-    feature_type: Literal["CLIP", "DINO", "SAMCLIP"] = "SAMCLIP"
     """Feature type to extract."""
     enable_cache: bool = True
     """Whether to cache extracted features."""
@@ -65,10 +45,9 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         del self.feature_dict
 
         # Set metadata, so we can initialize model with feature dimensionality
-        self.train_dataset.metadata["feature_type"] = self.config.feature_type
+        self.train_dataset.metadata["feature_type"] = "DINO"
         self.train_dataset.metadata["feature_dim_dict"] = feature_dim_dict
-        self.train_dataset.metadata["main_feature_name"] = feat_type_to_main_feature_name[self.config.feature_type]
-        self.train_dataset.metadata["clip_model_name"] = feat_type_to_args[self.config.feature_type].clip_model_name
+        self.train_dataset.metadata["main_feature_name"] = "dinov2"
 
         # Garbage collect
         torch.cuda.empty_cache()
@@ -76,17 +55,16 @@ class FeatureSplattingDataManager(FullImageDatamanager):
     
     def extract_features(self) -> Dict[str, Float[torch.Tensor, "n h w c"]]:
         # Extract features
-        if self.config.feature_type not in feat_type_to_extract_fn:
-            raise ValueError(f"Unknown feature type {self.config.feature_type}")
-        extract_fn = feat_type_to_extract_fn[self.config.feature_type]
-        extract_args = feat_type_to_args[self.config.feature_type]
+
+        extract_fn = batch_extract_feature
+        extract_args = DINOArgs
         image_fnames = self.train_dataset.image_filenames + self.eval_dataset.image_filenames
         # For dev purpose, visually tested image_fnames order matches camera_idx. NS seems to internally sort valid image_fnames.
         # self.feature_image_fnames = image_fnames
 
         # If cache exists, load it and validate it. We save it to the dataset directory.
         cache_dir = self.config.dataparser.data
-        cache_path = cache_dir / f"feature_splatting_{self.config.feature_type.lower()}_features.pt"
+        cache_path = cache_dir / f"feature_splatting_dino_features.pt"
         if self.config.enable_cache and cache_path.exists():
             cache_dict = torch.load(cache_path)
             if cache_dict.get("image_fnames") != image_fnames:
@@ -97,13 +75,13 @@ class FeatureSplattingDataManager(FullImageDatamanager):
                 return cache_dict["feature_dict"]
 
         # Cache is invalid or doesn't exist, so extract features
-        CONSOLE.print(f"Extracting {self.config.feature_type} features for {len(image_fnames)} images...")
+        CONSOLE.print(f"Extracting DINO features for {len(image_fnames)} images...")
         feature_dict = extract_fn(image_fnames, extract_args)
         if self.config.enable_cache:
             cache_dict = {"args": extract_args.id_dict(), "image_fnames": image_fnames, "feature_dict": feature_dict}
             cache_dir.mkdir(exist_ok=True)
             torch.save(cache_dict, cache_path)
-            CONSOLE.print(f"Saved {self.config.feature_type} features to cache at {cache_path}")
+            CONSOLE.print(f"Saved DINO features to cache at {cache_path}")
         return feature_dict
 
     def next_train(self, step: int) -> Tuple[Cameras, Dict]:

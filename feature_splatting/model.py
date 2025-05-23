@@ -9,32 +9,22 @@ import torch.nn.functional as F
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.rich_utils import CONSOLE
-from nerfstudio.viewer.server.viewer_elements import (
-    ViewerButton,
-    ViewerNumber,
-    ViewerText,
-    ViewerCheckbox,
-    ViewerSlider,
-    ViewerVec3,
-)
+from nerfstudio.viewer.server.viewer_elements import ViewerButton
+
 from nerfstudio.data.scene_box import OrientedBox
+from .config import TOTAL_STEPS, OPTIMIZER_SWITCH_STEP, USE_2DGS
 
 # Feature splatting functions
 from torch.nn import Parameter
 from feature_splatting.utils import (
     ViewerUtils,
     apply_pca_colormap_return_proj,
-    two_layer_mlp,
-    clip_text_encoder,
-    compute_similarity,
-    cluster_instance,
-    estimate_ground,
-    get_ground_bbox_min_max,
-    gaussian_editor
+    # two_layer_mlp,
+    cnn_decoder
 )
 try:
-    from gsplat.cuda._torch_impl import _quat_to_rotmat
-    from gsplat.rendering import rasterization
+    # from gsplat.cuda._torch_impl import _quat_to_rotmat
+    from gsplat.rendering import rasterization, rasterization_2dgs
 except ImportError:
     print("Please install gsplat>=1.0.0")
 
@@ -65,6 +55,7 @@ class FeatureSplattingModel(SplatfactoModel):
     config: FeatureSplattingModelConfig
 
     def populate_modules(self):
+        self.i_iteration = 0
         super().populate_modules()
         # Sanity check
         if self.config.python_compute_sh:
@@ -81,164 +72,39 @@ class FeatureSplattingModel(SplatfactoModel):
         self.main_feature_shape_chw = self.kwargs["metadata"]["feature_dim_dict"][self.main_feature_name]
 
         # Initialize the multi-head feature MLP
-        self.feature_mlp = two_layer_mlp(self.config.feat_latent_dim,
-                                         self.config.mlp_hidden_dim,
+        self.feature_mlp = cnn_decoder(self.config.feat_latent_dim,
+                                         #self.config.mlp_hidden_dim,
                                          self.kwargs["metadata"]["feature_dim_dict"])
         
         # Visualization utils
         self.maybe_populate_text_encoder()
         self.setup_gui()
-
-        self.gaussian_editor = gaussian_editor()
     
     def maybe_populate_text_encoder(self):
-        if "clip_model_name" in self.kwargs["metadata"]:
-            assert "clip" in self.main_feature_name.lower(), "CLIP model name should only be used with CLIP features"
-            self.clip_text_encoder = clip_text_encoder(self.kwargs["metadata"]["clip_model_name"], self.kwargs["device"])
-            self.text_encoding_func = self.clip_text_encoder.get_text_token
-        else:
-            self.text_encoding_func = None
+        self.text_encoding_func = lambda x: x
     
     def setup_gui(self):
         self.viewer_utils = ViewerUtils(self.text_encoding_func)
         # Note: the GUI elements are shown based on alphabetical variable names
         self.btn_refresh_pca = ViewerButton("Refresh PCA Projection", cb_hook=lambda _: self.viewer_utils.reset_pca_proj())
-        if "clip" in self.main_feature_name.lower():
-            self.hint_text = ViewerText(name="Note:", disabled=True, default_value="Use , to separate labels")
-            self.lang_1_pos_text = ViewerText(
-                name="Positive Text Queries",
-                default_value="",
-                cb_hook=lambda elem: self.viewer_utils.update_text_embedding('positive', elem.value),
-            )
-            self.lang_2_neg_text = ViewerText(
-                name="Negative Text Queries",
-                default_value="object",
-                cb_hook=lambda elem: self.viewer_utils.update_text_embedding('negative', elem.value),
-            )
-            # call the callback function with the default value
-            self.viewer_utils.update_text_embedding('negative', self.lang_2_neg_text.default_value)
-            self.lang_ground_text = ViewerText(
-                name="Ground Text Queries",
-                default_value="floor",
-                cb_hook=lambda elem: self.viewer_utils.update_text_embedding('ground', elem.value),
-            )
-            self.viewer_utils.update_text_embedding('ground', self.lang_ground_text.default_value)
-            self.softmax_temp = ViewerNumber(
-                name="Softmax temperature",
-                default_value=self.viewer_utils.softmax_temp,
-                cb_hook=lambda elem: self.viewer_utils.update_softmax_temp(elem.value),
-            )
-            # ===== Start Editing utility =====
-            self.edit_checkbox = ViewerCheckbox("Enter Editing Mode", default_value=False, cb_hook=lambda _: self.start_editing())
-            # Ground estimation
-            self.estimate_ground_btn = ViewerButton("Estimate Ground", cb_hook=lambda _: self.estimate_ground(), disabled=True, visible=False)
-            # Main object segmentation
-            self.segment_main_obj_btn = ViewerButton("Segment main obj", cb_hook=lambda _: self.segment_positive_obj(), disabled=True, visible=False)
-            self.bbox_min_offset_vec = ViewerVec3("BBox Min", default_value=(0, 0, 0), disabled=True, visible=False)
-            self.bbox_max_offset_vec = ViewerVec3("BBox Max", default_value=(0, 0, 0), disabled=True, visible=False)
-            self.main_obj_only_checkbox = ViewerCheckbox("View main object only", default_value=True, disabled=True, visible=False)
-            # Basic editing
-            self.translation_vec = ViewerVec3("Translation", default_value=(0, 0, 0), disabled=True, visible=False)
-            self.yaw_rotation = ViewerNumber("Yaw-only Rotation (deg)", default_value=0., disabled=True, visible=False)
-            # Physics simulation
-            self.physics_sim_checkbox = ViewerCheckbox("Physics Simulation", default_value=False, disabled=True, visible=False)
-            self.physics_sim_step_btn = ViewerButton("Physics Simulation Step", disabled=True, visible=False, cb_hook=lambda _: self.physics_sim_step())
-    
+
     def physics_sim_step(self):
         # It's just a placeholder now. NS needs some user interaction to send rendering requests.
         # So I make a button that does nothing but to trigger rendering.
         pass
     
     def estimate_ground(self):
-        selected_obj_idx, sample_idx = self.segment_gaussian('ground', use_canonical=True, threshold=0.5)
-        ground_means_xyz = self.means[sample_idx].detach().cpu().numpy()[selected_obj_idx]
-        self.ground_R, self.ground_T, ground_inliers = estimate_ground(ground_means_xyz)
-        self.gaussian_editor.register_ground_transform(self.ground_R, self.ground_T)
-
-        # Enable next step
-        self.segment_main_obj_btn.set_disabled(False)
-        self.segment_main_obj_btn.set_visible(True)
+        pass
     
     def start_editing(self):
-        self.estimate_ground_btn.set_disabled(False)
-        self.estimate_ground_btn.set_visible(True)
-
+        pass
     def segment_positive_obj(self):
-        selected_obj_idx, sample_idx = self.segment_gaussian('positive', use_canonical=False)
-
-        all_xyz = self.means.detach().cpu().numpy()
-        selected_xyz = all_xyz[sample_idx]
-
-        selected_obj_idx = cluster_instance(selected_xyz, selected_obj_idx)
-
-        # Get the boolean flag of selected particles (of all particles)
-        subset_idx = np.zeros(self.means.shape[0], dtype=bool)
-        subset_idx[sample_idx[selected_obj_idx]] = True
-
-        ground_min, ground_max = get_ground_bbox_min_max(all_xyz, subset_idx, self.ground_R, self.ground_T)
-
-        self.gaussian_editor.register_object_minimax(ground_min, ground_max)
-
-        # Enable bbox editing
-        self.bbox_min_offset_vec.set_disabled(False)
-        self.bbox_min_offset_vec.set_visible(True)
-        self.bbox_max_offset_vec.set_disabled(False)
-        self.bbox_max_offset_vec.set_visible(True)
-        self.main_obj_only_checkbox.set_disabled(False)
-        self.main_obj_only_checkbox.set_visible(True)
-
-        # Enable basic editing utilities
-        self.translation_vec.set_disabled(False)
-        self.translation_vec.set_visible(True)
-        self.yaw_rotation.set_disabled(False)
-        self.yaw_rotation.set_visible(True)
-
-        # Enable physics simulation
-        self.physics_sim_checkbox.set_disabled(False)
-        self.physics_sim_checkbox.set_visible(True)
-        self.physics_sim_step_btn.set_disabled(False)
-        self.physics_sim_step_btn.set_visible(True)
+        pass
     
     def segment_gaussian(self, field_name : str, use_canonical : bool, sample_size : Optional[int] = 2**15, threshold : Optional[float] = 0.5):
-        if "clip" not in self.main_feature_name.lower():
-            return
-        if sample_size is not None:
-            sample_size = min(2**15, self.means.shape[0])
-            sample_idx = torch.randperm(self.means.shape[0])[:sample_size]
-            sampled_features = self.distill_features[sample_idx]
-        else:
-            sample_idx = torch.arange(self.means.shape[0])
-            sampled_features = self.distill_features
-        clip_feature_nc = self.feature_mlp.per_gaussian_forward(sampled_features)[self.main_feature_name]
-        clip_feature_nc /= clip_feature_nc.norm(dim=1, keepdim=True)
-        clip_feature_cn = clip_feature_nc.permute(1, 0)
-
-        # Use paired softmax method as described in the paper with positive and negative texts
-        if not use_canonical and self.viewer_utils.is_embed_valid('negative'):
-            neg_embedding = self.viewer_utils.get_text_embed('negative')
-        else:
-            neg_embedding = self.viewer_utils.get_text_embed('canonical')
-        text_embs = torch.cat([self.viewer_utils.get_text_embed(field_name), neg_embedding], dim=0)
-        raw_sims = torch.einsum("cm,nc->nm", clip_feature_cn, text_embs)
-        pos_sim = compute_similarity(raw_sims, self.viewer_utils.softmax_temp, self.viewer_utils.get_embed_shape(field_name)[0])
-
-        # pos_sim -= pos_sim.min()
-        # pos_sim /= pos_sim.max()
-
-        selected_obj_idx = (pos_sim > threshold).cpu().numpy()
-
-        return selected_obj_idx, sample_idx
+        return None, None
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        """Takes in a camera and returns a dictionary of outputs.
-
-        Args:
-            camera: The camera(s) for which output images are rendered. It should have
-            all the needed information to compute the outputs.
-
-        Returns:
-            Outputs of model. (ie. rendered colors)
-        """
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -299,6 +165,8 @@ class FeatureSplattingModel(SplatfactoModel):
             render_mode = "RGB+ED"
         else:
             render_mode = "RGB"
+            
+        
 
         if self.config.sh_degree > 0:
             sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
@@ -309,30 +177,58 @@ class FeatureSplattingModel(SplatfactoModel):
             colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
             fused_render_properties = torch.cat((colors_crop, distill_features_crop), dim=1)
             sh_degree_to_use = None
-
-        render, alpha, self.info = rasterization(
-            means=means_crop,
-            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-            colors=fused_render_properties,
-            viewmats=viewmat,  # [1, 4, 4]
-            Ks=K,  # [1, 3, 3]
-            width=W,
-            height=H,
-            tile_size=BLOCK_WIDTH,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
-            absgrad=True,
-            rasterize_mode=self.config.rasterize_mode,
-            # set some threshold to disregrad small gaussians for faster rendering.
-            # radius_clip=3.0,
-        )
-
+        
+        if not USE_2DGS:
+            render, alpha, self.info = rasterization(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=fused_render_properties,
+                viewmats=viewmat,  # [1, 4, 4]
+                Ks=K,  # [1, 3, 3]
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode=render_mode,
+                sh_degree=sh_degree_to_use,
+                sparse_grad=False,
+                absgrad=True,
+                rasterize_mode=self.config.rasterize_mode,
+                # set some threshold to disregrad small gaussians for faster rendering.
+                # radius_clip=3.0,
+            )
+            # ignore during error computation
+            normals1 = torch.tensor((1.0, 0.0, 0.0))
+            normals2 = normals1
+        else:
+            render_mode = "RGB+ED"
+            render, alpha, normals, normals_from_depth, render_distort, render_median, self.info = rasterization_2dgs(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=fused_render_properties,
+                viewmats=viewmat,  # [1, 4, 4]
+                Ks=K,  # [1, 3, 3]
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode=render_mode,
+                sh_degree=sh_degree_to_use,
+                sparse_grad=False,
+                absgrad=True,
+                depth_mode="expected" # "median"
+            )
+            normals1 = normals.squeeze(0) 
+            normals2 = normals_from_depth.squeeze(0)
+            
         if self.training and self.info["means2d"].requires_grad:
             self.info["means2d"].retain_grad()
         self.xys = self.info["means2d"]  # [1, N, 2]
@@ -359,10 +255,15 @@ class FeatureSplattingModel(SplatfactoModel):
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
+            
+            "normals": normals1, 
+            "normals_from_depth": normals2, 
+            
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore,
             "feature": feature.squeeze(0),  # type: ignore
         }  # type: ignore
+        
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
         # Decode features
@@ -378,18 +279,74 @@ class FeatureSplattingModel(SplatfactoModel):
         return rendered_feat_dict
     
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        # print("FeatureSplattingModel::get_loss_dict")
         # Splatfacto computes the loss for the rgb image
-        loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
-        for k in batch['feature_dict']:
-            batch['feature_dict'][k] = batch['feature_dict'][k].to(self.device)
-        decoded_feature_dict = self.decode_features(outputs["feature"])
-        feature_loss = torch.tensor(0.0, device=self.device)
-        for key, target_feat in batch['feature_dict'].items():
-            cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
-            ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
-            target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
-            feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
-        loss_dict["feature_loss"] = self.config.feat_loss_weight * feature_loss
+        
+        # loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
+        
+        scale_reg = torch.tensor(1.0).to(self.device)
+        normal_loss = torch.tensor(0.0).to(self.device)
+        img_loss = torch.tensor(0.0).to(self.device)
+        feature_loss = torch.tensor(0.0).to(self.device)
+        
+        gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        pred_img = outputs["rgb"]
+
+        # Set masked part of both ground-truth and rendered image to black.
+        # This is a little bit sketchy for the SSIM loss.
+        if "mask" in batch:
+            # batch["mask"] : [H, W, 1]
+            mask = self._downscale_if_required(batch["mask"])
+            mask = mask.to(self.device)
+            assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
+            gt_img = gt_img * mask
+            pred_img = pred_img * mask
+
+        Ll1 = torch.abs(gt_img - pred_img).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        img_loss = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+        
+        if self.config.use_scale_regularization and self.step % 10 == 0:
+            scale_exp = torch.exp(self.scales)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                    torch.tensor(self.config.max_gauss_ratio),
+                )
+                - self.config.max_gauss_ratio
+            )
+            scale_reg = 0.1 * scale_reg.mean()
+        
+        if self.i_iteration > 7000:
+            normal_error = (1 - (outputs['normals'] * outputs['normals_from_depth']).sum(dim=0))[None]
+            normal_loss = 0.05 * (normal_error).mean()
+        
+        if self.i_iteration >= OPTIMIZER_SWITCH_STEP:
+            for k in batch['feature_dict']:
+                batch['feature_dict'][k] = batch['feature_dict'][k].to(self.device)
+            decoded_feature_dict = self.decode_features(outputs["feature"])
+            feature_loss = torch.tensor(0.0, device=self.device)
+            for key, target_feat in batch['feature_dict'].items():#key in ["samclip" - with weight 1.0, "dinov2" with weight 0.1]
+                # cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
+                # print(key, cur_loss_weight, self.main_feature_name)
+                ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
+                target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
+                # feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
+                feature_loss += torch.abs(decoded_feature_dict[key] - target_feat).mean() #* cur_loss_weight
+            feature_loss = self.config.feat_loss_weight * feature_loss
+        
+        loss_dict = {
+            "main_loss": img_loss + normal_loss,
+            "feature_loss": feature_loss,
+            "scale_reg": scale_reg,
+        }
+        
+        if self.training:
+            # Add loss from camera optimizer
+            self.camera_optimizer.get_loss_dict(loss_dict)
+        
+        self.i_iteration += 1
+        # print(loss_dict)
         return loss_dict
     
     @torch.no_grad()
@@ -397,51 +354,11 @@ class FeatureSplattingModel(SplatfactoModel):
         """This function is not called during training, but used for visualization in browser. So we can use it to
         add visualization not needed during training.
         """
-        editing_dict = self.gaussian_editor.prepare_editing_dict(self.translation_vec.value, self.yaw_rotation.value, self.physics_sim_checkbox.value)
-        if self.edit_checkbox.value:
-            # Editing mode
-            self.gaussian_editor.pre_rendering_process(self.means, self.opacities, self.scales, self.quats,
-                                                       editing_dict=editing_dict,
-                                                       min_offset=torch.tensor(self.bbox_min_offset_vec.value).float().cuda() / 10.0,
-                                                       max_offset=torch.tensor(self.bbox_max_offset_vec.value).float().cuda() / 10.0,
-                                                       view_main_obj_only=self.main_obj_only_checkbox.value)
         outs = super().get_outputs_for_camera(camera, obb_box)
-        if self.edit_checkbox.value:
-            self.gaussian_editor.post_rendering_process(self.means, self.opacities, self.quats, self.scales)
-        if self.physics_sim_checkbox.value:
-            # turn off feature rendering during physics sim for speed
-            return outs
-        # Consistent pca that does not flicker
         outs["consistent_latent_pca"], self.viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
             outs["feature"], self.viewer_utils.pca_proj
         )
-        # TODO(roger): this resize factor affects the resolution of similarity map. Maybe we should use a fixed size?
-        decoded_feature_dict = self.decode_features(outs["feature"], resize_factor=8)
-        if "clip" in self.main_feature_name.lower() and self.viewer_utils.is_embed_valid('positive'):
-            clip_features = decoded_feature_dict[self.main_feature_name]
-            clip_features /= clip_features.norm(dim=0, keepdim=True)
-
-            # Use paired softmax method as described in the paper with positive and negative texts
-            if self.viewer_utils.is_embed_valid('negative'):
-                neg_embedding = self.viewer_utils.get_text_embed('negative')
-            else:
-                neg_embedding = self.viewer_utils.get_text_embed('canonical')
-            text_embs = torch.cat([self.viewer_utils.get_text_embed('positive'), neg_embedding], dim=0)
-            raw_sims = torch.einsum("chw,nc->nhw", clip_features, text_embs)
-            sim_shape_hw = raw_sims.shape[1:]
-
-            raw_sims = raw_sims.reshape(raw_sims.shape[0], -1)
-            pos_sim = compute_similarity(raw_sims, self.viewer_utils.softmax_temp, self.viewer_utils.get_embed_shape('positive')[0])
-            outs["similarity"] = pos_sim.reshape(sim_shape_hw + (1,)) # H, W, 1
-            
-            # Upsample heatmap to match size of RGB image
-            # It's a bit slow since we do it on full resolution; but interpolation seems to have aliasing issues
-            assert outs["similarity"].shape[2] == 1
-            if outs["similarity"].shape[:2] != outs["rgb"].shape[:2]:
-                out_sim = outs["similarity"][:, :, 0]  # H, W
-                out_sim = out_sim[None, None, ...]  # 1, 1, H, W
-                outs["similarity"] = F.interpolate(out_sim, size=outs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze()
-                outs["similarity"] = outs["similarity"][:, :, None]
+        
         return outs
     
     # ===== Utils functions for managing the gaussians =====

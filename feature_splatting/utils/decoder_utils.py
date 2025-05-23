@@ -28,33 +28,26 @@ class two_layer_mlp(nn.Module):
             ret_dict[key] = F.linear(intermediate_feature, nn_mod.weight.view(nn_mod.weight.size(0), -1), nn_mod.bias)
         return ret_dict
 
-def compute_similarity(prob_mn, softmax_temp, num_pos, heatmap_method="standard_softmax"):
-    """
-    Compute probability of an element being positive
 
-    Args:
-        prob_mn: Tensor of shape (m, n); where m is the number of total classes; n is the number of elements
-        softmax_temp: float
-        num_pos: int
-    """
-    assert num_pos <= prob_mn.shape[0]
-    if heatmap_method == "standard_softmax":  # Feature splatting uses this
-        prob_mn = prob_mn / softmax_temp
-        probs = prob_mn.softmax(dim=0)
-        pos_sim = probs[:num_pos].sum(dim=0)  # H, W
-        return pos_sim
-    elif heatmap_method == "pairwise_softmax":  # F3RM uses this
-        # Broadcast positive label similarities to all negative labels
-        pos_sims = prob_mn[:num_pos]
-        neg_sims = prob_mn[num_pos:]
-        pos_sims = pos_sims.mean(dim=0, keepdim=True)
-        pos_sims = pos_sims.broadcast_to(neg_sims.shape)
-        paired_sims = torch.cat([pos_sims, neg_sims], dim=0)
+class cnn_decoder(nn.Module):
+    def __init__(self, input_dim, feature_dim_dict):
+        super().__init__()
+        # self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=1).cuda()
+        feature_branch_dict = {}
+        for key, feat_dim_chw in feature_dim_dict.items():
+            feature_branch_dict[key] = nn.Conv2d(input_dim, feat_dim_chw[0], kernel_size=1, stride=1, padding=0)
+        self.feature_branch_dict = nn.ModuleDict(feature_branch_dict)
 
-        # Compute paired softmax
-        probs = (paired_sims / softmax_temp).softmax(dim=0)[:1, ...]
-        torch.nan_to_num_(probs, nan=0.0)
-        sims, _ = probs.min(dim=0)
-        return sims
-    else:
-        raise ValueError(f"Unknown heatmap method: {heatmap_method}")
+    def forward(self, x):
+        # return self.conv(x)
+        ret_dict = {}
+        for key, nn_mod in self.feature_branch_dict.items():
+            ret_dict[key] = nn_mod(x)
+        return ret_dict
+    
+    @torch.no_grad()
+    def per_gaussian_forward(self, x):
+        ret_dict = {}
+        for key, nn_mod in self.feature_branch_dict.items():
+            ret_dict[key] = F.linear(x, nn_mod.weight.view(nn_mod.weight.size(0), -1), nn_mod.bias)
+        return ret_dict
