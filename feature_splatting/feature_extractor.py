@@ -19,7 +19,10 @@ def pytorch_gc():
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     gc.collect()
-
+    
+def some_function():
+    return s
+ 
 def resize_image(img, longest_edge):
     # resize to have the longest edge equal to longest_edge
     width, height = img.size
