@@ -93,9 +93,9 @@ feature_splatting_method = MethodSpecification(
             datamanager=FeatureSplattingDataManagerConfig(
                 dataparser=NerfstudioDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
+                enable_cache=False # changed to False to skip fature-saving (time and space consuming procedure)
             ),
             model=FeatureSplattingModelConfig(sh_degree=0),
-            enable_cache=False # changed to False to skip fature-saving (time and space consuming procedure)
         ),
         
         optimizers={
