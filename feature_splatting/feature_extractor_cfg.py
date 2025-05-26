@@ -1,7 +1,7 @@
 class DINOArgs:
     dino_resolution: int = 800
     dinov2_model_name: str = 'dinov2_vits14'
-    upsampled: bool = False
+    upsampled: bool = True
     
     @classmethod
     def id_dict(cls):

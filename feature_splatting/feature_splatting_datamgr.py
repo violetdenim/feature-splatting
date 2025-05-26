@@ -1,4 +1,6 @@
 import gc
+import os
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Tuple, Type
 from nerfstudio.cameras.cameras import Cameras, CameraType
@@ -65,21 +67,28 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         # If cache exists, load it and validate it. We save it to the dataset directory.
         cache_dir = self.config.dataparser.data
         cache_path = cache_dir / f"feature_splatting_dino_features.pt"
-        if self.config.enable_cache and cache_path.exists():
-            cache_dict = torch.load(cache_path)
+        if self.config.enable_cache and os.path.exists(cache_path):
+            cache_dict = torch.load(cache_dir)
             if cache_dict.get("image_fnames") != image_fnames:
                 CONSOLE.print("Image filenames have changed, cache invalidated...")
             elif cache_dict.get("args") != extract_args.id_dict():
                 CONSOLE.print("Feature extraction args have changed, cache invalidated...")
             else:
                 return cache_dict["feature_dict"]
+            
 
         # Cache is invalid or doesn't exist, so extract features
         CONSOLE.print(f"Extracting DINO features for {len(image_fnames)} images...")
         feature_dict = extract_fn(image_fnames, extract_args)
         if self.config.enable_cache:
-            cache_dict = {"args": extract_args.id_dict(), "image_fnames": image_fnames, "feature_dict": feature_dict}
             cache_dir.mkdir(exist_ok=True)
+            
+            cache_dict = {
+                "args": extract_args.id_dict(),\
+                "image_fnames": image_fnames,
+                "feature_dict": feature_dict
+            }
+            
             torch.save(cache_dict, cache_path)
             CONSOLE.print(f"Saved DINO features to cache at {cache_path}")
         return feature_dict

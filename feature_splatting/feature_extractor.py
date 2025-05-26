@@ -52,7 +52,7 @@ def batch_extract_feature(image_paths: List[str], args):
     print("Loading DINOv2 model...")
     if use_upsampled_dino:
         dinov2 = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).to(device)    
-        resolution = 784 #
+        resolution = 392 # 784 #
         patch_size = 14
     else:
         dinov2 = torch.hub.load('facebookresearch/dinov2', args.dinov2_model_name).to(device)
@@ -62,27 +62,28 @@ def batch_extract_feature(image_paths: List[str], args):
 
     ret_dict = {'dinov2': []}
     for i in trange(len(image_paths)):
-        image = Image.open(image_paths[i])
-        image = torch.tensor(np.float32(image)/255.).permute([2, 0, 1]).unsqueeze(0).to(device=device)
-        image, target_H, target_W = interpolate_to_patch_size(image, resolution, patch_size)
-        if use_upsampled_dino:
-            features = dinov2(norm(image))
-            features = features.cpu().squeeze(0)
-        else:
-            with torch.no_grad():
-                features = dinov2.forward_features((image - 0.5) / 0.5)["x_norm_patchtokens"][0]
-                features = features.cpu()
-                features = features.reshape((target_H // patch_size, target_W // patch_size, -1)).permute([2, 0, 1])
         
-        ret_dict['dinov2'].append(features)
+        try:
+            image = Image.open(image_paths[i])
+            image = torch.tensor(np.float32(image)/255.).permute([2, 0, 1]).unsqueeze(0).to(device=device)
+            image, target_H, target_W = interpolate_to_patch_size(image, resolution, patch_size)
+            if use_upsampled_dino:
+                features = dinov2(norm(image))
+                features = features.cpu().squeeze(0)
+            else:
+                with torch.no_grad():
+                    features = dinov2.forward_features((image - 0.5) / 0.5)["x_norm_patchtokens"][0]
+                    features = features.cpu()
+                    features = features.reshape((target_H // patch_size, target_W // patch_size, -1)).permute([2, 0, 1])
+            if i == 0:
+                ret_dict['dinov2'] = torch.zeros([len(image_paths), features.shape[0], features.shape[1], features.shape[2]], dtype=features.dtype, device='cpu')
+            ret_dict['dinov2'][i, ...] = features
+        except Exception as e:
+            print(f"Exception {e}\n")
+            exit(-1)
     
-    print(ret_dict['dinov2'][0].shape)
     del dinov2
     pytorch_gc()
-    
-    for k in ret_dict.keys():
-        ret_dict[k] = torch.stack(ret_dict[k], dim=0)  # BCHW
-
     return ret_dict
 
 if __name__ == "__main__":
