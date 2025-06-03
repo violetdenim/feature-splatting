@@ -1,12 +1,14 @@
-import time
+import os, time
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+import torchvision.transforms as transforms
 
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
+from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat, resize_image
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.viewer.server.viewer_elements import ViewerButton
@@ -27,6 +29,63 @@ try:
     from gsplat.rendering import rasterization, rasterization_2dgs
 except ImportError:
     print("Please install gsplat>=1.0.0")
+    
+    
+    
+    
+def contrastive_2d_loss(segmask, features, dim_features):
+    """
+    Compute the contrastive clustering loss for a 2D feature map.
+
+    :param segmask: Tensor of shape (H, W).
+    :param features: Tensor of shape (H, W, D), where (H, W) is the resolution and D is the dimensionality of these features.
+    :param id_unique_list: Tensor of shape (n_p).
+    :n_i_list: Tensor of shape (n_p).
+    :dim_features: is the dimensionality of the features (equal to D).
+    :lambda_val: Weighting factor for the loss.
+
+    :return: loss value.
+    """
+
+    # get number of masks and number of px per mask
+    segmask = segmask.squeeze(-1)
+    id_unique_list, n_i_list = torch.unique(segmask, return_counts=True)
+    
+    n_p = id_unique_list.shape[0] # Number of ids
+    
+    features = features / (features.norm(dim=-1, keepdim=True) + 1e-9)
+
+    f_mean_per_cluster = torch.zeros((n_p, dim_features)).cuda()
+    phi_per_cluster = torch.zeros((n_p, 1)).cuda()
+
+    # go over all masks
+    # f_is = []
+    for i in range(n_p):
+        # get all features, corresponding to current mask and take the mean
+        f_i = features[(segmask == id_unique_list[i]).to(segmask.device), :]
+        # f_is.append(f_i)
+        
+        f_mean_per_cluster[i, ...] = torch.mean(f_i, dim=0, keepdim=True)
+        
+        # temperature for softmax, calculated as average distance between cluster mean and all features
+        phi_per_cluster[i] = torch.norm(f_i - f_mean_per_cluster[i], dim=1, keepdim=True).sum() / (n_i_list[i] * torch.log(n_i_list[i] + 100))
+            
+    phi_per_cluster = torch.clip(phi_per_cluster * 10, min=0.1, max=1.0)
+    phi_per_cluster = phi_per_cluster.detach()
+    loss_per_cluster = torch.zeros(n_p).cuda()
+
+    for i in range(n_p):
+        f_mean = f_mean_per_cluster[i]
+        phi = phi_per_cluster[i]
+        f_ij = features[(segmask == id_unique_list[i]).to(segmask.device), :]
+        
+        num = torch.exp(torch.matmul(f_ij, f_mean) / (phi + 1e-6)) # dim (ni)
+        den = torch.sum(torch.exp(torch.matmul(f_ij, f_mean_per_cluster.transpose(-1, -2)) / (phi_per_cluster.transpose(-1, -2) + 1e-6)), dim=1) # dim (n_i)
+        
+        loss_per_cluster[i] = torch.sum(torch.log(num / (den + 1e-6)))
+            
+    return -torch.mean(loss_per_cluster)
+
 
 @dataclass
 class FeatureSplattingModelConfig(SplatfactoModelConfig):
@@ -68,6 +127,7 @@ class FeatureSplattingModel(SplatfactoModel):
         # Initialize per-Gaussian features
         distill_features = torch.nn.Parameter(torch.zeros((self.means.shape[0], self.config.feat_latent_dim)))
         self.gauss_params["distill_features"] = distill_features
+        
         self.main_feature_name = self.kwargs["metadata"]["main_feature_name"]
         self.main_feature_shape_chw = self.kwargs["metadata"]["feature_dim_dict"][self.main_feature_name]
 
@@ -145,6 +205,7 @@ class FeatureSplattingModel(SplatfactoModel):
         # features_dc_crop.shape: [N, 3]
         # features_rest_crop.shape: [N, 15, 3]
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
+        
         # colors_crop.shape: [N, 16, 3]
 
         BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
@@ -154,6 +215,7 @@ class FeatureSplattingModel(SplatfactoModel):
         K = camera.get_intrinsics_matrices().cuda()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
+       
         camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
         # apply the compensation of screen space blurring to gaussians
@@ -251,7 +313,7 @@ class FeatureSplattingModel(SplatfactoModel):
             background = background.expand(H, W, 3)
         
         feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
-
+        
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
@@ -292,19 +354,8 @@ class FeatureSplattingModel(SplatfactoModel):
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
-        # Set masked part of both ground-truth and rendered image to black.
-        # This is a little bit sketchy for the SSIM loss.
-        if "mask" in batch:
-            # batch["mask"] : [H, W, 1]
-            mask = self._downscale_if_required(batch["mask"])
-            mask = mask.to(self.device)
-            assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
-            gt_img = gt_img * mask
-            pred_img = pred_img * mask
-
-        Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
-        img_loss = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+        img_loss = (1 - self.config.ssim_lambda) * torch.abs(gt_img - pred_img).mean() + self.config.ssim_lambda * simloss 
         
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
@@ -321,22 +372,28 @@ class FeatureSplattingModel(SplatfactoModel):
             normal_error = (1 - (outputs['normals'] * outputs['normals_from_depth']).sum(dim=0))[None]
             normal_loss = 0.05 * (normal_error).mean()
         
-        if self.i_iteration >= OPTIMIZER_SWITCH_STEP:
-            for k in batch['feature_dict']:
-                batch['feature_dict'][k] = batch['feature_dict'][k].to(self.device)
-            decoded_feature_dict = self.decode_features(outputs["feature"])
-            feature_loss = torch.tensor(0.0, device=self.device)
-            for key, target_feat in batch['feature_dict'].items():#key in ["samclip" - with weight 1.0, "dinov2" with weight 0.1]
-                # cur_loss_weight = 1.0 if key == self.main_feature_name else self.config.feat_aux_loss_weight
-                # print(key, cur_loss_weight, self.main_feature_name)
-                ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
-                target_feat[:, ignore_feat_mask] = decoded_feature_dict[key][:, ignore_feat_mask]
-                # feature_loss += cosine_loss(decoded_feature_dict[key], target_feat) * cur_loss_weight
-                feature_loss += torch.abs(decoded_feature_dict[key] - target_feat).mean() #* cur_loss_weight
-            feature_loss = self.config.feat_loss_weight * feature_loss
+        if self.i_iteration >= 0:#OPTIMIZER_SWITCH_STEP:
+            target_feat = batch['feature_dict']['dinov2'].to(self.device)
+            decoded_feature = self.decode_features(outputs["feature"])["dinov2"]
+            
+            ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
+            target_feat[:, ignore_feat_mask] = decoded_feature[:, ignore_feat_mask]
+            # L1
+            feature_loss = self.config.feat_loss_weight * torch.abs(decoded_feature - target_feat).mean() 
+            
+            # decoded_feature = decoded_feature.permute(1, 2, 0)
+            # assert("segmentation" in batch)
+            # sg_mask = batch["segmentation"]
+            # assert sg_mask.shape[:2] == decoded_feature.shape[:2]
+            # assert sg_mask.ndim == 2
+            # assert decoded_feature.ndim == 3
+            # assert decoded_feature.shape[-1] == 384
+            # feature_loss = 1e-4 * contrastive_2d_loss(sg_mask.long().to(self.device),
+            #                                           decoded_feature,
+            #                                           dim_features=decoded_feature.shape[-1])
         
         loss_dict = {
-            "main_loss": img_loss + normal_loss,
+            "main_loss": img_loss + normal_loss, # + feature_loss,
             "feature_loss": feature_loss,
             "scale_reg": scale_reg,
         }
@@ -347,6 +404,7 @@ class FeatureSplattingModel(SplatfactoModel):
         
         self.i_iteration += 1
         # print(loss_dict)
+        
         return loss_dict
     
     @torch.no_grad()
@@ -354,7 +412,11 @@ class FeatureSplattingModel(SplatfactoModel):
         """This function is not called during training, but used for visualization in browser. So we can use it to
         add visualization not needed during training.
         """
-        outs = super().get_outputs_for_camera(camera, obb_box)
+        
+        # outs = super().get_outputs_for_camera(camera, obb_box)
+        assert camera is not None, "must provide camera to gaussian model"
+        self.set_crop(obb_box)
+        outs = self.get_outputs(camera.to(self.device))
         outs["consistent_latent_pca"], self.viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
             outs["feature"], self.viewer_utils.pca_proj
         )

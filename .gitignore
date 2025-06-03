@@ -166,4 +166,7 @@ cython_debug/
 feature_splatting/test
 feature_splatting/data
 feature_splatting/outputs
+outputs
 *.pt
+feature_splatting/model.py
+Untitled.ipynb

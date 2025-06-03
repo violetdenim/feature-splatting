@@ -62,7 +62,6 @@ def batch_extract_feature(image_paths: List[str], args):
 
     ret_dict = {'dinov2': []}
     for i in trange(len(image_paths)):
-        
         try:
             image = Image.open(image_paths[i])
             image = torch.tensor(np.float32(image)/255.).permute([2, 0, 1]).unsqueeze(0).to(device=device)
