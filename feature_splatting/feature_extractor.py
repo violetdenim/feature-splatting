@@ -82,178 +82,225 @@ class MaskCLIPFeaturizer(nn.Module):
         features = self.model.get_patch_encodings(img).to(torch.float32)
         return features.reshape(b, patch_h, patch_w, -1).permute(0, 3, 1, 2)
 
+# @torch.no_grad()
+# def batch_extract_feature(image_paths: List[str], args):
+#     norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+#     yolo_iou = 0.9
+#     yolo_conf = 0.4
+
+#     # For part-level CLIP
+#     transform = T.Compose([
+#         T.Resize((args.part_resolution, args.part_resolution)),
+#         T.ToTensor(),
+#         norm
+#     ])
+
+#     # For object-level CLIP
+#     raw_transform = T.Compose([
+#         T.ToTensor(),
+#         norm
+#     ])
+
+#     dino_transform = T.Compose([
+#         T.ToTensor(),
+#         T.Normalize(mean=[0.5], std=[0.5]),
+#     ])
+
+#     mobilesamv2, ObjAwareModel, predictor = torch.hub.load("RogerQi/MobileSAMV2", args.mobilesamv2_encoder_name)
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     mobilesamv2.to(device=device)
+#     mobilesamv2.eval()
+
+#     ret_dict = {'samclip': [], 'dinov2': []}
+#     print(f"Computing features for {len(image_paths)} images.")
+    
+#     print("Loading DINOv2 model...")
+#     dinov2 = torch.hub.load('facebookresearch/dinov2', args.dinov2_model_name)
+#     dinov2 = dinov2.to(device)
+
+#     for i in trange(len(image_paths)):
+#         image = Image.open(image_paths[i])
+#         image = resize_image(image, args.dino_resolution)
+#         image = dino_transform(image)[:3].unsqueeze(0)
+#         image, target_H, target_W = interpolate_to_patch_size(image, dinov2.patch_size)
+#         image = image.cuda()
+#         with torch.no_grad():
+#             features = dinov2.forward_features(image)["x_norm_patchtokens"][0]
+
+#         features = features.cpu()
+
+#         features_hwc = features.reshape((target_H // dinov2.patch_size, target_W // dinov2.patch_size, -1))
+#         features_chw = features_hwc.permute((2, 0, 1))
+
+#         ret_dict['dinov2'].append(features_chw)
+    
+#     del dinov2
+#     pytorch_gc()
+
+#     clip_model = MaskCLIPFeaturizer(args.clip_model_name).cuda().eval()
+
+#     # ======================
+#     for i in trange(len(image_paths)):
+#         image_file_path = str(image_paths[i])
+
+#         image = cv2.imread(image_file_path)
+#         # resize to longest edge
+#         if max(image.shape[:2]) > args.sam_size:
+#             if image.shape[0] > image.shape[1]:
+#                 image = cv2.resize(image, (int(args.sam_size * image.shape[1] / image.shape[0]), args.sam_size))
+#             else:
+#                 image = cv2.resize(image, (args.sam_size, int(args.sam_size * image.shape[0] / image.shape[1])))
+#         image = image[:, :, ::-1]  # BGR to RGB
+
+#         raw_input_image = raw_transform(Image.fromarray(image))
+#         whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
+#         clip_feat_dim = whole_image_feature.shape[0]
+
+#         raw_img_H, raw_img_W = image.shape[:2]
+
+#         # part level
+#         small_W = args.part_feat_res
+#         small_H = raw_img_H * small_W // raw_img_W
+
+#         # obj level
+#         object_W = args.obj_feat_res
+#         object_H = raw_img_H * object_W // raw_img_W
+
+#         final_W = args.final_feat_res
+#         final_H = raw_img_H * final_W // raw_img_W
+
+#         # ===== Object-aware Model =====
+#         obj_results = ObjAwareModel(image, device=device, imgsz=args.sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
+#         if not obj_results:
+#             # Add an all-zero tensor if no object is detected
+#             ret_dict['samclip'].append(torch.zeros((clip_feat_dim, final_H, final_W)))
+#             continue
+
+#         predictor.set_image(image)
+#         input_boxes1 = obj_results[0].boxes.xyxy
+#         input_boxes = input_boxes1.cpu().numpy()
+#         input_boxes = predictor.transform.apply_boxes(input_boxes, predictor.original_size)
+#         input_boxes = torch.from_numpy(input_boxes).cuda()
+#         sam_mask = []
+#         image_embedding = predictor.features
+#         image_embedding = torch.repeat_interleave(image_embedding, 320, dim=0)
+#         prompt_embedding = mobilesamv2.prompt_encoder.get_dense_pe()
+#         prompt_embedding = torch.repeat_interleave(prompt_embedding, 320, dim=0)
+#         for (boxes,) in batch_iterator(320, input_boxes):
+#             with torch.no_grad():
+#                 image_embedding = image_embedding[0:boxes.shape[0],:,:,:]
+#                 prompt_embedding = prompt_embedding[0:boxes.shape[0],:,:,:]
+#                 sparse_embeddings, dense_embeddings = mobilesamv2.prompt_encoder(
+#                     points=None,
+#                     boxes=boxes,
+#                     masks=None,)
+#                 low_res_masks, _ = mobilesamv2.mask_decoder(
+#                     image_embeddings=image_embedding,
+#                     image_pe=prompt_embedding,
+#                     sparse_prompt_embeddings=sparse_embeddings,
+#                     dense_prompt_embeddings=dense_embeddings,
+#                     multimask_output=False,
+#                     simple_type=True,
+#                 )
+#                 low_res_masks = predictor.model.postprocess_masks(low_res_masks, predictor.input_size, predictor.original_size)
+#                 sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold) * 1.0
+#                 sam_mask.append(sam_mask_pre.squeeze(1))
+
+#         sam_mask = torch.cat(sam_mask)
+#         # Visualize SAM mask
+#         # annotation = sam_mask
+#         # areas = torch.sum(annotation, dim=(1, 2))
+#         # sorted_indices = torch.argsort(areas, descending=True)
+#         # show_img = annotation[sorted_indices]
+#         # ann_img = show_anns(show_img)
+#         # save_img_path = obj_feat_path_list[i].replace('.npy', '_mask.png')
+#         # Image.fromarray((ann_img * 255).astype(np.uint8)).save(save_img_path)
+
+#         # ===== Object-level CLIP feature =====
+#         # Interpolate CLIP features to image size
+#         resized_clip_feat_map_bchw = torch.nn.functional.interpolate(whole_image_feature.unsqueeze(0).float(),
+#                                                                 size=(object_H, object_W),
+#                                                                 mode='bilinear',
+#                                                                 align_corners=False)
+
+#         mask_tensor_bchw = sam_mask.unsqueeze(1)
+
+#         resized_mask_tensor_bchw = torch.nn.functional.interpolate(mask_tensor_bchw.float(),
+#                                                                 size=(object_H, object_W),
+#                                                                 mode='nearest').bool()
+
+#         aggregated_feat_map = torch.zeros((clip_feat_dim, object_H, object_W), dtype=torch.float32, device=device)
+#         aggregated_feat_cnt_map = torch.zeros((object_H, object_W), dtype=int, device=device)
+
+#         for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
+#             aggregared_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask_tensor_bchw[mask_idx, 0]]
+#             aggregared_clip_feat = aggregared_clip_feat.mean(dim=1)
+
+#             aggregated_feat_map[:, resized_mask_tensor_bchw[mask_idx, 0]] += aggregared_clip_feat[:, None]
+#             aggregated_feat_cnt_map[resized_mask_tensor_bchw[mask_idx, 0]] += 1
+            
+#         aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None, :, :] + 1e-6)
+#         aggregated_feat_map = F.interpolate(aggregated_feat_map[None], (final_H, final_W), mode='bilinear', align_corners=False)[0]
+
+#         ret_dict['samclip'].append(aggregated_feat_map.detach().cpu())
+
+#         gc.collect()
+    
+#     del clip_model
+#     del mobilesamv2
+#     del ObjAwareModel
+#     pytorch_gc()
+    
+#     for k in ret_dict.keys():
+#         ret_dict[k] = torch.stack(ret_dict[k], dim=0)  # BCHW
+
+#     return ret_dict
+
+def norm(x, m=[0.485, 0.456, 0.406], s=[0.229, 0.224, 0.225]):
+    y = torch.zeros_like(x)
+    for i in range(3):
+        y[:, i, :, :] = (x[:, i, :, :] - m[i]) / s[i]
+    return y
+
 @torch.no_grad()
 def batch_extract_feature(image_paths: List[str], args):
-    norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    yolo_iou = 0.9
-    yolo_conf = 0.4
-
-    # For part-level CLIP
-    transform = T.Compose([
-        T.Resize((args.part_resolution, args.part_resolution)),
-        T.ToTensor(),
-        norm
-    ])
-
-    # For object-level CLIP
-    raw_transform = T.Compose([
-        T.ToTensor(),
-        norm
-    ])
-
-    dino_transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=[0.5], std=[0.5]),
-    ])
-
-    mobilesamv2, ObjAwareModel, predictor = torch.hub.load("RogerQi/MobileSAMV2", args.mobilesamv2_encoder_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    mobilesamv2.to(device=device)
-    mobilesamv2.eval()
-
-    ret_dict = {'samclip': [], 'dinov2': []}
-    print(f"Computing features for {len(image_paths)} images.")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_upsampled_dino = args.upsampled
     
     print("Loading DINOv2 model...")
-    dinov2 = torch.hub.load('facebookresearch/dinov2', args.dinov2_model_name)
-    dinov2 = dinov2.to(device)
+    if use_upsampled_dino:
+        dinov2 = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).to(device)    
+        resolution = 392 # 784 #
+        patch_size = 14
+    else:
+        dinov2 = torch.hub.load('facebookresearch/dinov2', args.dinov2_model_name).to(device)
+        patch_size = dinov2.patch_size
+        resolution = args.dino_resolution
+    
 
+    ret_dict = {'dinov2': []}
     for i in trange(len(image_paths)):
-        image = Image.open(image_paths[i])
-        image = resize_image(image, args.dino_resolution)
-        image = dino_transform(image)[:3].unsqueeze(0)
-        image, target_H, target_W = interpolate_to_patch_size(image, dinov2.patch_size)
-        image = image.cuda()
-        with torch.no_grad():
-            features = dinov2.forward_features(image)["x_norm_patchtokens"][0]
-
-        features = features.cpu()
-
-        features_hwc = features.reshape((target_H // dinov2.patch_size, target_W // dinov2.patch_size, -1))
-        features_chw = features_hwc.permute((2, 0, 1))
-
-        ret_dict['dinov2'].append(features_chw)
+        try:
+            image = Image.open(image_paths[i])
+            image = torch.tensor(np.float32(image)/255.).permute([2, 0, 1]).unsqueeze(0).to(device=device)
+            image, target_H, target_W = interpolate_to_patch_size(image, resolution, patch_size)
+            if use_upsampled_dino:
+                features = dinov2(norm(image))
+                features = features.cpu().squeeze(0)
+            else:
+                with torch.no_grad():
+                    features = dinov2.forward_features((image - 0.5) / 0.5)["x_norm_patchtokens"][0]
+                    features = features.cpu()
+                    features = features.reshape((target_H // patch_size, target_W // patch_size, -1)).permute([2, 0, 1])
+            if i == 0:
+                ret_dict['dinov2'] = torch.zeros([len(image_paths), features.shape[0], features.shape[1], features.shape[2]], dtype=features.dtype, device='cpu')
+            ret_dict['dinov2'][i, ...] = features
+        except Exception as e:
+            print(f"Exception {e}\n")
+            exit(-1)
     
     del dinov2
     pytorch_gc()
-
-    clip_model = MaskCLIPFeaturizer(args.clip_model_name).cuda().eval()
-
-    # ======================
-    for i in trange(len(image_paths)):
-        image_file_path = str(image_paths[i])
-
-        image = cv2.imread(image_file_path)
-        # resize to longest edge
-        if max(image.shape[:2]) > args.sam_size:
-            if image.shape[0] > image.shape[1]:
-                image = cv2.resize(image, (int(args.sam_size * image.shape[1] / image.shape[0]), args.sam_size))
-            else:
-                image = cv2.resize(image, (args.sam_size, int(args.sam_size * image.shape[0] / image.shape[1])))
-        image = image[:, :, ::-1]  # BGR to RGB
-
-        raw_input_image = raw_transform(Image.fromarray(image))
-        whole_image_feature = clip_model(raw_input_image[None].cuda())[0]
-        clip_feat_dim = whole_image_feature.shape[0]
-
-        raw_img_H, raw_img_W = image.shape[:2]
-
-        # part level
-        small_W = args.part_feat_res
-        small_H = raw_img_H * small_W // raw_img_W
-
-        # obj level
-        object_W = args.obj_feat_res
-        object_H = raw_img_H * object_W // raw_img_W
-
-        final_W = args.final_feat_res
-        final_H = raw_img_H * final_W // raw_img_W
-
-        # ===== Object-aware Model =====
-        obj_results = ObjAwareModel(image, device=device, imgsz=args.sam_size, conf=yolo_conf, iou=yolo_iou, verbose=False)
-        if not obj_results:
-            # Add an all-zero tensor if no object is detected
-            ret_dict['samclip'].append(torch.zeros((clip_feat_dim, final_H, final_W)))
-            continue
-
-        predictor.set_image(image)
-        input_boxes1 = obj_results[0].boxes.xyxy
-        input_boxes = input_boxes1.cpu().numpy()
-        input_boxes = predictor.transform.apply_boxes(input_boxes, predictor.original_size)
-        input_boxes = torch.from_numpy(input_boxes).cuda()
-        sam_mask = []
-        image_embedding = predictor.features
-        image_embedding = torch.repeat_interleave(image_embedding, 320, dim=0)
-        prompt_embedding = mobilesamv2.prompt_encoder.get_dense_pe()
-        prompt_embedding = torch.repeat_interleave(prompt_embedding, 320, dim=0)
-        for (boxes,) in batch_iterator(320, input_boxes):
-            with torch.no_grad():
-                image_embedding = image_embedding[0:boxes.shape[0],:,:,:]
-                prompt_embedding = prompt_embedding[0:boxes.shape[0],:,:,:]
-                sparse_embeddings, dense_embeddings = mobilesamv2.prompt_encoder(
-                    points=None,
-                    boxes=boxes,
-                    masks=None,)
-                low_res_masks, _ = mobilesamv2.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=prompt_embedding,
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=False,
-                    simple_type=True,
-                )
-                low_res_masks = predictor.model.postprocess_masks(low_res_masks, predictor.input_size, predictor.original_size)
-                sam_mask_pre = (low_res_masks > mobilesamv2.mask_threshold) * 1.0
-                sam_mask.append(sam_mask_pre.squeeze(1))
-
-        sam_mask = torch.cat(sam_mask)
-        # Visualize SAM mask
-        # annotation = sam_mask
-        # areas = torch.sum(annotation, dim=(1, 2))
-        # sorted_indices = torch.argsort(areas, descending=True)
-        # show_img = annotation[sorted_indices]
-        # ann_img = show_anns(show_img)
-        # save_img_path = obj_feat_path_list[i].replace('.npy', '_mask.png')
-        # Image.fromarray((ann_img * 255).astype(np.uint8)).save(save_img_path)
-
-        # ===== Object-level CLIP feature =====
-        # Interpolate CLIP features to image size
-        resized_clip_feat_map_bchw = torch.nn.functional.interpolate(whole_image_feature.unsqueeze(0).float(),
-                                                                size=(object_H, object_W),
-                                                                mode='bilinear',
-                                                                align_corners=False)
-
-        mask_tensor_bchw = sam_mask.unsqueeze(1)
-
-        resized_mask_tensor_bchw = torch.nn.functional.interpolate(mask_tensor_bchw.float(),
-                                                                size=(object_H, object_W),
-                                                                mode='nearest').bool()
-
-        aggregated_feat_map = torch.zeros((clip_feat_dim, object_H, object_W), dtype=torch.float32, device=device)
-        aggregated_feat_cnt_map = torch.zeros((object_H, object_W), dtype=int, device=device)
-
-        for mask_idx in range(resized_mask_tensor_bchw.shape[0]):
-            aggregared_clip_feat = resized_clip_feat_map_bchw[0, :, resized_mask_tensor_bchw[mask_idx, 0]]
-            aggregared_clip_feat = aggregared_clip_feat.mean(dim=1)
-
-            aggregated_feat_map[:, resized_mask_tensor_bchw[mask_idx, 0]] += aggregared_clip_feat[:, None]
-            aggregated_feat_cnt_map[resized_mask_tensor_bchw[mask_idx, 0]] += 1
-            
-        aggregated_feat_map = aggregated_feat_map / (aggregated_feat_cnt_map[None, :, :] + 1e-6)
-        aggregated_feat_map = F.interpolate(aggregated_feat_map[None], (final_H, final_W), mode='bilinear', align_corners=False)[0]
-
-        ret_dict['samclip'].append(aggregated_feat_map.detach().cpu())
-
-        gc.collect()
-    
-    del clip_model
-    del mobilesamv2
-    del ObjAwareModel
-    pytorch_gc()
-    
-    for k in ret_dict.keys():
-        ret_dict[k] = torch.stack(ret_dict[k], dim=0)  # BCHW
-
     return ret_dict
 
 if __name__ == "__main__":

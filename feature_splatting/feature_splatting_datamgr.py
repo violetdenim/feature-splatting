@@ -1,4 +1,5 @@
-import gc
+import gc, os, cv2
+from tqdm import tqdm
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Tuple, Type
 from nerfstudio.cameras.cameras import Cameras, CameraType
@@ -70,6 +71,27 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         self.train_dataset.metadata["main_feature_name"] = feat_type_to_main_feature_name[self.config.feature_type]
         self.train_dataset.metadata["clip_model_name"] = feat_type_to_args[self.config.feature_type].clip_model_name
 
+
+        # load segmentations
+        print('Loading segmentations!')
+        segm_path = os.path.join(self.config.data / "segmentations")
+        assert(os.path.exists(segm_path))
+        segm_files = sorted(os.listdir(segm_path))
+        
+        self.train_segment = []
+        self.eval_segment = []
+        for i_file, f in tqdm(enumerate(segm_files), total=len(segm_files)):
+            segm_img = np.load(os.path.join(segm_path, f))
+            # downsample immediately to feature shape
+            h, w = feature_dim_dict[feature_name][-2:]
+            segm_img = cv2.resize(segm_img, (w, h), interpolation=cv2.INTER_NEAREST)
+            segm_img = torch.tensor(segm_img).to(self.device).squeeze(0)
+            
+            if i_file < len(self.train_dataset):
+                self.train_segment.append(segm_img)
+            else:
+                self.eval_segment.append(segm_img)
+                
         # Garbage collect
         torch.cuda.empty_cache()
         gc.collect()
@@ -113,6 +135,8 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         for feature_name in self.train_feature_dict:
             feature_dict[feature_name] = self.train_feature_dict[feature_name][camera_idx]
         data["feature_dict"] = feature_dict
+        segmentation = self.train_segment[camera_idx].to(dtype=torch.uint8)
+        data["segmentation"] = segmentation
         return camera, data
     
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
@@ -122,4 +146,6 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         for feature_name in self.eval_feature_dict:
             feature_dict[feature_name] = self.eval_feature_dict[feature_name][camera_idx]
         data["feature_dict"] = feature_dict
+        segmentation = self.eval_segment[camera_idx].to(dtype=torch.uint8)
+        data["segmentation"] = segmentation
         return camera, data
