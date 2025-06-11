@@ -372,28 +372,28 @@ class FeatureSplattingModel(SplatfactoModel):
             normal_error = (1 - (outputs['normals'] * outputs['normals_from_depth']).sum(dim=0))[None]
             normal_loss = 0.05 * (normal_error).mean()
         
-        if self.i_iteration >= 0:#OPTIMIZER_SWITCH_STEP:
+        if self.i_iteration >= OPTIMIZER_SWITCH_STEP:
             target_feat = batch['feature_dict']['dinov2'].to(self.device)
             decoded_feature = self.decode_features(outputs["feature"])["dinov2"]
             
             ignore_feat_mask = (torch.sum(target_feat == 0, dim=0) == target_feat.shape[0])
             target_feat[:, ignore_feat_mask] = decoded_feature[:, ignore_feat_mask]
             # L1
-            feature_loss = self.config.feat_loss_weight * torch.abs(decoded_feature - target_feat).mean() 
+            # feature_loss = self.config.feat_loss_weight * torch.abs(decoded_feature - target_feat).mean() 
             
-            # decoded_feature = decoded_feature.permute(1, 2, 0)
-            # assert("segmentation" in batch)
-            # sg_mask = batch["segmentation"]
-            # assert sg_mask.shape[:2] == decoded_feature.shape[:2]
-            # assert sg_mask.ndim == 2
-            # assert decoded_feature.ndim == 3
-            # assert decoded_feature.shape[-1] == 384
-            # feature_loss = 1e-4 * contrastive_2d_loss(sg_mask.long().to(self.device),
-            #                                           decoded_feature,
-            #                                           dim_features=decoded_feature.shape[-1])
+            decoded_feature = decoded_feature.permute(1, 2, 0)
+            assert("segmentation" in batch)
+            sg_mask = batch["segmentation"]
+            assert sg_mask.shape[:2] == decoded_feature.shape[:2]
+            assert sg_mask.ndim == 2
+            assert decoded_feature.ndim == 3
+            assert decoded_feature.shape[-1] == 384
+            feature_loss = 1e-4 * contrastive_2d_loss(sg_mask.long().to(self.device),
+                                                      decoded_feature,
+                                                      dim_features=decoded_feature.shape[-1])
         
         loss_dict = {
-            "main_loss": img_loss + normal_loss, # + feature_loss,
+            "main_loss": img_loss + normal_loss, 
             "feature_loss": feature_loss,
             "scale_reg": scale_reg,
         }

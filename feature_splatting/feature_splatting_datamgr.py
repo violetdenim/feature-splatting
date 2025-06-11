@@ -147,14 +147,14 @@ class FeatureSplattingDataManager(FullImageDatamanager):
         camera, data = super().next_train(step)
         camera_idx = camera.metadata['cam_idx']
         data["feature_dict"] = self.__upsample_features(self.train_feature_dict, camera_idx, None)
-        # segmentation = self.train_segment[camera_idx].to(dtype=torch.uint8)
-        # data["segmentation"] = segmentation
+        segmentation = self.train_segment[camera_idx].to(dtype=torch.uint8)
+        data["segmentation"] = segmentation
         return camera, data
     
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
         camera, data = super().next_eval(step)
         camera_idx = camera.metadata['cam_idx']
         data["feature_dict"] = self.__upsample_features(self.eval_feature_dict, camera_idx, None)
-        # segmentation = self.eval_segment[camera_idx].to(dtype=torch.uint8)
-        # data["segmentation"] = segmentation
+        segmentation = self.eval_segment[camera_idx].to(dtype=torch.uint8)
+        data["segmentation"] = segmentation
         return camera, data

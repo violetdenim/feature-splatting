@@ -123,7 +123,7 @@ feature_splatting_method = MethodSpecification(
                 "scheduler": None,
             },
             "distill_features": {
-                "optimizer": DelayedAdamOptimizerConfig(lr=0.0025, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
                 "scheduler": None,
                 # "scheduler": ExponentialDecaySchedulerConfig(
                 #     lr_final=5e-4,
@@ -131,7 +131,7 @@ feature_splatting_method = MethodSpecification(
                 # ),
             },
             "feature_mlp": {
-                "optimizer": DelayedAdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": None,
             },
             "quats": {"optimizer": InterruptedAdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
